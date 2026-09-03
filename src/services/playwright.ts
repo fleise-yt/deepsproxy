@@ -37,7 +37,8 @@ export async function initPlaywright(headless = true) {
   });
 
   // Keep an active page to fetch PoW headers on demand
-  activePage = await context.newPage();
+  const pages = context.pages();
+  activePage = pages.length > 0 ? pages[0] : await context.newPage();
 }
 
 export async function closePlaywright() {
@@ -46,29 +47,40 @@ export async function closePlaywright() {
     await context.close();
     context = null;
     activePage = null;
+    powQueue = Promise.resolve();
   }
 }
 
+let powQueue: Promise<any> = Promise.resolve();
+
 /**
  * Ensures the session is valid and extracts headers, PoW, and session ID.
+ * Serialized through powQueue to avoid browser state corruption from concurrent calls.
  */
-export async function getDeepSeekHeaders(forceNew = false): Promise<{ headers: Record<string, string>, chatSessionId: string, parentMessageId: number | null }> {
+export function getDeepSeekHeaders(forceNew = false): Promise<{ headers: Record<string, string>, chatSessionId: string, parentMessageId: number | null }> {
   if (process.env.TEST_MOCK_PLAYWRIGHT) {
     // Generate a unique session ID if requested for testing isolation
     const mockSessionId = process.env.TEST_SESSION_ID || 'mock-session';
-    return { headers: { authorization: 'Bearer MOCK' }, chatSessionId: mockSessionId, parentMessageId: null };
+    return Promise.resolve({ headers: { authorization: 'Bearer MOCK' }, chatSessionId: mockSessionId, parentMessageId: null });
   }
 
+  const next = powQueue.catch(() => {}).then(() => _getDeepSeekHeadersInternal(forceNew));
+  powQueue = next;
+  return next;
+}
+
+async function _getDeepSeekHeadersInternal(forceNew = false): Promise<{ headers: Record<string, string>, chatSessionId: string, parentMessageId: number | null }> {
   if (!activePage) {
     throw new Error('Playwright not initialized');
   }
 
-  // Navigate to deepseek chat. If forceNew is true or we're not on deepseek, go to home page.
+  // Navigate to deepseek chat home page if not already there, or if forceNew is true.
+  // Modern DeepSeek URLs use UUIDs like /a/chat/s/<uuid>; staying on a specific chat
+  // after an aborted turn breaks subsequent submissions.
   const currentUrl = activePage.url();
-  const isOnDeepSeek = currentUrl.includes('chat.deepseek.com');
-  const isOnSpecificChat = isOnDeepSeek && /\/chat\/\d+/.test(currentUrl);
+  const isOnHomePage = currentUrl === 'https://chat.deepseek.com/' || currentUrl === 'https://chat.deepseek.com';
 
-  if (!isOnDeepSeek || forceNew || isOnSpecificChat) {
+  if (!isOnHomePage || forceNew) {
     await activePage.goto('https://chat.deepseek.com/', { waitUntil: 'domcontentloaded' });
   }
 
@@ -111,54 +123,72 @@ export async function getDeepSeekHeaders(forceNew = false): Promise<{ headers: R
   });
 
   return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error('Timeout waiting for PoW headers')), 30000);
+    const timeout = setTimeout(() => {
+      activePage?.unroute('**/api/v0/chat/completion', routeHandler).catch(() => {});
+      reject(new Error('Timeout waiting for PoW headers'));
+    }, 20000);
 
     const routeHandler = async (route: any, request: any) => {
       clearTimeout(timeout);
-      
-      const reqHeaders = request.headers();
-      let uiSessionId = '';
-      let uiParentMessageId: number | null = null;
+      try {
+        const reqHeaders = request.headers();
+        let uiSessionId = '';
+        let uiParentMessageId: number | null = null;
 
-      const postData = request.postData();
-      if (postData) {
-        try {
-          const payload = JSON.parse(postData);
-          if (payload.chat_session_id) {
-            uiSessionId = payload.chat_session_id;
+        const postData = request.postData();
+        if (postData) {
+          try {
+            const payload = JSON.parse(postData);
+            if (payload.chat_session_id) {
+              uiSessionId = payload.chat_session_id;
+            }
+            if (payload.parent_message_id !== undefined) {
+              uiParentMessageId = payload.parent_message_id;
+            }
+          } catch (e) {
+            // ignore parsing error
           }
-          if (payload.parent_message_id !== undefined) {
-            uiParentMessageId = payload.parent_message_id;
-          }
-        } catch (e) {
-          // ignore parsing error
         }
+
+        const extractedHeaders = {
+          'x-ds-pow-response': reqHeaders['x-ds-pow-response'] || '',
+          'x-hif-dliq': reqHeaders['x-hif-dliq'] || '',
+          'x-hif-leim': reqHeaders['x-hif-leim'] || '',
+          'authorization': reqHeaders['authorization'] || '',
+          'cookie': reqHeaders['cookie'] || ''
+        };
+
+        currentHeaders = extractedHeaders;
+
+        // Abort to prevent polluting chat history
+        await route.abort('aborted').catch(() => {});
+
+        // Cleanup route
+        await activePage!.unroute('**/api/v0/chat/completion', routeHandler).catch(() => {});
+
+        resolve({ headers: extractedHeaders, chatSessionId: uiSessionId, parentMessageId: uiParentMessageId });
+      } catch (err) {
+        reject(err);
       }
-
-      const extractedHeaders = {
-        'x-ds-pow-response': reqHeaders['x-ds-pow-response'] || '',
-        'x-hif-dliq': reqHeaders['x-hif-dliq'] || '',
-        'x-hif-leim': reqHeaders['x-hif-leim'] || '',
-        'authorization': reqHeaders['authorization'] || '',
-        'cookie': reqHeaders['cookie'] || ''
-      };
-
-      currentHeaders = extractedHeaders;
-
-      // Abort to prevent polluting chat history
-      await route.abort('aborted');
-      
-      // Cleanup route
-      await activePage!.unroute('**/api/v0/chat/completion', routeHandler);
-
-      resolve({ headers: extractedHeaders, chatSessionId: uiSessionId, parentMessageId: uiParentMessageId });
     };
 
-    activePage!.route('**/api/v0/chat/completion', routeHandler).then(() => {
-      // Trigger PoW generation by typing and hitting enter
-      activePage!.fill('textarea', 'a').then(() => {
-        activePage!.keyboard.press('Enter');
-      });
+    activePage!.route('**/api/v0/chat/completion', routeHandler).then(async () => {
+      try {
+        const input = await activePage!.waitForSelector(chatInputSelector, { timeout: 5000 });
+        if (input) {
+          await input.fill('a');
+          await activePage!.keyboard.press('Enter');
+        } else {
+          throw new Error('Chat input not found');
+        }
+      } catch (err) {
+        clearTimeout(timeout);
+        await activePage?.unroute('**/api/v0/chat/completion', routeHandler).catch(() => {});
+        reject(err);
+      }
+    }).catch((err) => {
+      clearTimeout(timeout);
+      reject(err);
     });
   });
 }
