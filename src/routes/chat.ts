@@ -9,7 +9,6 @@
  */
 
 import { Context } from 'hono';
-import { stream as honoStream } from 'hono/streaming';
 import { v4 as uuidv4 } from 'uuid';
 import { createDeepSeekStream, updateSessionParent } from '../services/deepseek.ts';
 import { OpenAIRequest, ChoiceDelta, Message, ToolCall, Usage } from '../utils/types.ts';
@@ -23,6 +22,7 @@ import {
   incrementalMessages,
   registerExplicitSession,
   registerLineageSession,
+  unregisterExplicitSession,
 } from '../services/hybrid-sessions.ts';
 
 const TOOL_START = '<tool_call>';
@@ -250,9 +250,10 @@ async function parseDeepSeekStreamToOpenAI(
   promptTokens: number,
   _uiSessionId: string,
   tools: any[] = [],
-  emit?: EmitChunk
+  emit?: EmitChunk,
+  existingReader?: ReadableStreamDefaultReader<any>
 ): Promise<ParsedCompletion> {
-  const reader = deepSeekStream.getReader();
+  const reader = existingReader || deepSeekStream.getReader();
   const decoder = new TextDecoder();
 
   let currentAppendPath = '';
@@ -386,7 +387,8 @@ async function parseDeepSeekStreamToOpenAI(
     }
   };
 
-  while (true) {
+  try {
+    while (true) {
     const { done, value } = await reader.read();
     if (done) break;
 
@@ -480,6 +482,12 @@ async function parseDeepSeekStreamToOpenAI(
     usage,
     responseMessageId
   };
+  } catch (error) {
+    await reader.cancel(error).catch(() => {});
+    throw error;
+  } finally {
+    try { reader.releaseLock(); } catch {}
+  }
 }
 
 function hasSemanticDeepSeekEvent(data: any, state: { path: string }): boolean {
@@ -556,7 +564,8 @@ async function peekStream(stream: ReadableStream): Promise<{ isEmpty: boolean; p
       return { isEmpty: false, peekedStream };
     }
   } catch (error) {
-    reader.releaseLock();
+    await reader.cancel(error).catch(() => {});
+    try { reader.releaseLock(); } catch {}
     throw error;
   }
 }
@@ -576,6 +585,7 @@ export async function chatCompletions(c: Context) {
     let hybridSession = initialSession;
     let releaseBootstrapLock: (() => void) | undefined;
     let releaseSessionLock: (() => void) | undefined;
+    let heldCanonicalSessionId: string | undefined;
     let lockTransferredToStream = false;
 
     try {
@@ -583,11 +593,20 @@ export async function chatCompletions(c: Context) {
       // registers a chat, queued requests migrate to that chat's canonical lock.
       if (!hybridSession && explicitSessionKey) {
         releaseBootstrapLock = await acquireSessionLease(`explicit:${explicitSessionKey}`);
+        if (!releaseBootstrapLock) {
+          c.header('Retry-After', '1');
+          return c.json({ error: { message: 'Timed out waiting for the conversation session', type: 'rate_limit_exceeded', code: 'session_busy' } }, 429);
+        }
         hybridSession = findExplicitSession(explicitSessionKey) || findLineageSession(messages);
       }
 
       if (hybridSession) {
         releaseSessionLock = await acquireSessionLease(`chat:${hybridSession.chatSessionId}`);
+        if (!releaseSessionLock) {
+          c.header('Retry-After', '1');
+          return c.json({ error: { message: 'Timed out waiting for the conversation session', type: 'rate_limit_exceeded', code: 'session_busy' } }, 429);
+        }
+        heldCanonicalSessionId = hybridSession.chatSessionId;
         releaseBootstrapLock?.();
         releaseBootstrapLock = undefined;
         // Re-read after waiting: an earlier request may have advanced the chat.
@@ -605,7 +624,8 @@ export async function chatCompletions(c: Context) {
       const response = await chatCompletionsHybrid(
         c, body, messages, outboundMessages,
         hybridSession, explicitSessionKey,
-        isStream ? releaseSessionLock : undefined
+        isStream ? releaseSessionLock : undefined,
+        isStream ? heldCanonicalSessionId : undefined
       );
       lockTransferredToStream = isStream && !!releaseSessionLock;
       return response;
@@ -616,7 +636,10 @@ export async function chatCompletions(c: Context) {
   } catch (err: any) {
     console.error('Error in chatCompletions dispatch:', err);
     const message = err?.message || String(err);
-    let status = err?.upstreamStatus || 500;
+    const upstreamStatus = Number(err?.upstreamStatus);
+    let status = err?.upstreamStatus === undefined
+      ? 500
+      : (Number.isInteger(upstreamStatus) && upstreamStatus >= 400 && upstreamStatus <= 599 ? upstreamStatus : 502);
     let code = status === 429 ? 'rate_limit_exceeded' : 'upstream_error';
     if (/account is suspended/i.test(message)) {
       status = 403;
@@ -628,14 +651,14 @@ export async function chatCompletions(c: Context) {
       status = 409;
       code = 'deepseek_chat_unavailable';
     }
-    return c.json({ error: { message, type: code, code } }, status);
+    return c.json({ error: { message, type: code, code } }, status as any);
   }
 }
 
 function isNonRetryableFailure(error: any): boolean {
   const status = error?.upstreamStatus;
   const message = error?.message || String(error);
-  return status === 401 || status === 403 || status === 504 ||
+  return status === 401 || status === 403 || status === 429 || status === 503 || status === 504 ||
     /account is suspended|login is required|chat input unavailable|Timeout waiting for chat input/i.test(message);
 }
 
@@ -644,9 +667,10 @@ async function chatCompletionsHybrid(
   body: OpenAIRequest,
   messages: any[],
   outboundMessages: any[],
-  hybridSession: { chatSessionId: string; parentMessageId: number; matchedLength?: number } | undefined,
+  hybridSession: { chatSessionId: string; parentMessageId: number | null; matchedLength?: number } | undefined,
   explicitSessionKey: string | undefined,
-  releaseSessionLock?: () => void
+  releaseSessionLock?: () => void,
+  heldCanonicalSessionId?: string
 ) {
   const isStream = body.stream ?? false;
   const canPublishLineage = !hybridSession || hybridSession.matchedLength !== undefined;
@@ -763,6 +787,7 @@ async function chatCompletionsHybrid(
     let lastError: any = null;
     let promptSizeUsed = 0;
     let releaseCanonicalStreamLock: (() => void) | undefined;
+    let provisionalSessionPublished = false;
 
     while (attempt < maxAttempts) {
       attempt++;
@@ -821,8 +846,18 @@ async function chatCompletionsHybrid(
     // A bootstrap initially owns explicit:<key>. Acquire the canonical chat lock
     // before the chat can be registered under lineage/other aliases, and hold
     // both leases until the client stream completes or is cancelled.
-    if (!hybridSession && releaseSessionLock && uiSessionId) {
-      releaseCanonicalStreamLock = await acquireSessionLease(`chat:${uiSessionId}`);
+    if (!hybridSession && uiSessionId) {
+      if (heldCanonicalSessionId !== uiSessionId) {
+        releaseCanonicalStreamLock = await acquireSessionLease(`chat:${uiSessionId}`);
+        if (!releaseCanonicalStreamLock) {
+          await deepSeekStream.cancel(new Error('Timed out waiting for the canonical session lease')).catch(() => {});
+          const error: any = new Error('Timed out waiting for the conversation session');
+          error.upstreamStatus = 429;
+          throw error;
+        }
+      }
+      registerExplicitSession(uiSessionId, uiSessionId, null);
+      provisionalSessionPublished = true;
     }
 
     c.header('Content-Type', 'text/event-stream');
@@ -833,56 +868,91 @@ async function chatCompletionsHybrid(
 
     const promptTokens = Math.ceil(promptSizeUsed / 3.5);
 
-    return honoStream(c, async (streamWriter: any) => {
-      const writeEvent = async (data: any) => {
-        await streamWriter.write(`data: ${JSON.stringify(data)}\n\n`);
-      };
-      try {
-        await writeEvent(makeChunk(completionId, body.model, { role: 'assistant', content: '' }));
+    const downstreamAbort = new AbortController();
+    const deepSeekReader = deepSeekStream.getReader();
+    let cleanupPromise: Promise<void> | undefined;
+    const cleanup = (reason: any = new Error('Proxy stream closed')): Promise<void> => {
+      if (!cleanupPromise) {
+        cleanupPromise = (async () => {
+          if (!downstreamAbort.signal.aborted) downstreamAbort.abort(reason);
+          await deepSeekReader.cancel(reason).catch(() => {});
+          if (provisionalSessionPublished) {
+            unregisterExplicitSession(uiSessionId, uiSessionId, true);
+          }
+          releaseSessionLock?.();
+          releaseCanonicalStreamLock?.();
+        })();
+      }
+      return cleanupPromise;
+    };
+    const encoder = new TextEncoder();
+    const responseStream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        const writeEvent = async (data: any) => {
+          if (downstreamAbort.signal.aborted) throw downstreamAbort.signal.reason;
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+        };
+        void (async () => {
+          try {
+            await writeEvent(makeChunk(completionId, body.model, { role: 'assistant', content: '' }));
 
-        const parsed = await parseDeepSeekStreamToOpenAI(
-          deepSeekStream!,
-          completionId,
-          body.model,
-          promptTokens,
-          uiSessionId,
-          (body as any).tools || [],
-          writeEvent
-        );
+            const parsed = await parseDeepSeekStreamToOpenAI(
+              deepSeekStream!,
+              completionId,
+              body.model,
+              promptTokens,
+              uiSessionId,
+              (body as any).tools || [],
+              writeEvent,
+              deepSeekReader
+            );
 
-        if (
-          parsed.responseMessageId !== null &&
-          (parsed.content !== '' || parsed.reasoningContent !== '' || parsed.toolCalls.length > 0)
-        ) {
-          updateSessionParent(uiSessionId, parsed.responseMessageId);
-          const assistantMessage: any = {
-            role: 'assistant',
-            content: parsed.toolCalls.length > 0 ? null : parsed.content,
-          };
-          if (parsed.reasoningContent) assistantMessage.reasoning_content = parsed.reasoningContent;
-          if (parsed.toolCalls.length > 0) assistantMessage.tool_calls = parsed.toolCalls;
-          if (canPublishLineage) registerLineageSession([...messages, assistantMessage], uiSessionId, parsed.responseMessageId);
-          registerExplicitSession(explicitSessionKey, uiSessionId, parsed.responseMessageId);
-          registerExplicitSession(uiSessionId, uiSessionId, parsed.responseMessageId);
-        }
-
-        await writeEvent(makeChunk(completionId, body.model, {}, parsed.finishReason, parsed.usage));
-        await streamWriter.write('data: [DONE]\n\n');
-      } catch (error: any) {
-        const code = error?.upstreamStatus === 504 ? 'upstream_timeout' : 'upstream_stream_error';
-        try {
-          await writeEvent({
-            error: {
-              message: error?.message || String(error),
-              type: code,
-              code,
+            if (
+              !downstreamAbort.signal.aborted &&
+              parsed.responseMessageId !== null &&
+              (parsed.content !== '' || parsed.reasoningContent !== '' || parsed.toolCalls.length > 0)
+            ) {
+              updateSessionParent(uiSessionId, parsed.responseMessageId);
+              const assistantMessage: any = {
+                role: 'assistant',
+                content: parsed.toolCalls.length > 0 ? null : parsed.content,
+              };
+              if (parsed.reasoningContent) assistantMessage.reasoning_content = parsed.reasoningContent;
+              if (parsed.toolCalls.length > 0) assistantMessage.tool_calls = parsed.toolCalls;
+              if (canPublishLineage) registerLineageSession([...messages, assistantMessage], uiSessionId, parsed.responseMessageId);
+              registerExplicitSession(explicitSessionKey, uiSessionId, parsed.responseMessageId);
+              registerExplicitSession(uiSessionId, uiSessionId, parsed.responseMessageId);
             }
-          });
-          await streamWriter.write('data: [DONE]\n\n');
-        } catch {}
-      } finally {
-        releaseSessionLock?.();
-        releaseCanonicalStreamLock?.();
+
+            await writeEvent(makeChunk(completionId, body.model, {}, parsed.finishReason, parsed.usage));
+            if (!downstreamAbort.signal.aborted) {
+              controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+              controller.close();
+            }
+          } catch (error: any) {
+            if (!downstreamAbort.signal.aborted) {
+              const code = error?.upstreamStatus === 504 ? 'upstream_timeout' : 'upstream_stream_error';
+              try {
+                await writeEvent({
+                  error: {
+                    message: error?.message || String(error),
+                    type: code,
+                    code,
+                  }
+                });
+                controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+                controller.close();
+              } catch {}
+            }
+          } finally {
+            await cleanup();
+          }
+        })();
+      },
+      async cancel(reason) {
+        await cleanup(reason || new Error('Downstream client disconnected'));
       }
     });
+
+    return c.body(responseStream as any);
 }

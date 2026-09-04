@@ -77,7 +77,11 @@ test('explicit and lineage aliases for one chat share the same lock', async () =
   let maxActive = 0;
   let releaseFirstConcurrent!: () => void;
   let signalFirstConcurrent!: () => void;
+  let signalSecondConcurrent!: () => void;
+  let firstConcurrentReleased = false;
+  let secondArrivedBeforeRelease = false;
   const firstConcurrentEntered = new Promise<void>(resolve => { signalFirstConcurrent = resolve; });
+  const secondConcurrentEntered = new Promise<void>(resolve => { signalSecondConcurrent = resolve; });
   const gate = new Promise<void>(resolve => { releaseFirstConcurrent = resolve; });
   const restore = setupFetchMock(async () => {
     calls++;
@@ -88,6 +92,9 @@ test('explicit and lineage aliases for one chat share the same lock', async () =
       if (call === 2) {
         signalFirstConcurrent();
         await gate;
+      } else {
+        secondArrivedBeforeRelease = !firstConcurrentReleased;
+        signalSecondConcurrent();
       }
       active--;
     }
@@ -116,12 +123,15 @@ test('explicit and lineage aliases for one chat share the same lock', async () =
       ],
       stream: false,
     });
-    await new Promise(resolve => setTimeout(resolve, 25));
-    assert.strictEqual(maxActive, 1);
+    firstConcurrentReleased = true;
     releaseFirstConcurrent();
+    await secondConcurrentEntered;
+    assert.strictEqual(secondArrivedBeforeRelease, false);
+    assert.strictEqual(maxActive, 1);
     assert.strictEqual((await explicit).status, 200);
     assert.strictEqual((await lineage).status, 200);
   } finally {
+    firstConcurrentReleased = true;
     releaseFirstConcurrent();
     delete process.env.TEST_SESSION_ID;
     restore();
@@ -207,7 +217,7 @@ test('upstream HTTP status is propagated through the OpenAI-compatible endpoint'
   try {
     const response = await request({ model: 'deepseek-v4-pro', messages: [{ role: 'user', content: 'test' }], stream: false });
     assert.strictEqual(response.status, 429);
-    assert.strictEqual(attempts, 3);
+    assert.strictEqual(attempts, 1);
   } finally {
     restore();
   }

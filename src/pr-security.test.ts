@@ -4,6 +4,7 @@ import assert from 'node:assert';
 process.env.TEST_MOCK_PLAYWRIGHT = 'true';
 
 import { app, assertSafeListenConfig } from './index.ts';
+import { acquireSessionLease } from './services/hybrid-sessions.ts';
 
 function setupFetchMock(handler: (url: string, init?: RequestInit) => Response | Promise<Response>) {
   const originalFetch = globalThis.fetch;
@@ -147,6 +148,132 @@ test('streaming timeout emits an OpenAI-compatible SSE error and releases cleanl
   } finally {
     delete process.env.DEEPSPROXY_UPSTREAM_TIMEOUT_MS;
     restore();
+  }
+});
+
+test('client cancellation cancels the upstream DeepSeek stream', async () => {
+  let sourceController!: ReadableStreamDefaultController<Uint8Array>;
+  let sourceCancelled = false;
+  const restore = setupFetchMock(() => new Response(new ReadableStream({
+    start(controller) {
+      sourceController = controller;
+      controller.enqueue(new TextEncoder().encode('event: ready\ndata: {"response_message_id":18001}\n\n'));
+      controller.enqueue(new TextEncoder().encode('data: {"p":"response/content","v":"partial"}\n\n'));
+    },
+    cancel() {
+      sourceCancelled = true;
+    }
+  }), { status: 200 }));
+
+  try {
+    const response = await request({
+      model: 'deepseek-v4-pro', session_id: 'client-cancel-key',
+      messages: [{ role: 'user', content: 'cancel stream' }], stream: true,
+    });
+    const reader = response.body!.getReader();
+    await reader.read();
+    await reader.cancel('client disconnected');
+    assert.strictEqual(sourceCancelled, true);
+  } finally {
+    if (!sourceCancelled) sourceController.close();
+    restore();
+  }
+});
+
+test('immediate response cancellation awaits upstream cancellation before releasing the session', async () => {
+  let firstSourceCancelled = false;
+  let cancellationFinished = false;
+  let fetches = 0;
+  let releaseCancellation!: () => void;
+  let signalCancellationStarted!: () => void;
+  let signalSecondFetch!: () => void;
+  const cancellationGate = new Promise<void>(resolve => { releaseCancellation = resolve; });
+  const cancellationStarted = new Promise<void>(resolve => { signalCancellationStarted = resolve; });
+  const secondFetchStarted = new Promise<void>(resolve => { signalSecondFetch = resolve; });
+  const restore = setupFetchMock(() => {
+    fetches++;
+    if (fetches > 1) {
+      signalSecondFetch();
+      return upstream(18002, 'second');
+    }
+    return new Response(new ReadableStream({
+      start(controller) {
+        controller.enqueue(new TextEncoder().encode('event: ready\ndata: {"response_message_id":18001}\n\n'));
+        controller.enqueue(new TextEncoder().encode('data: {"p":"response/content","v":"partial"}\n\n'));
+      },
+      async cancel() {
+        firstSourceCancelled = true;
+        signalCancellationStarted();
+        await cancellationGate;
+        cancellationFinished = true;
+      }
+    }), { status: 200 });
+  });
+  process.env.DEEPSPROXY_SESSION_LEASE_TIMEOUT_MS = '200';
+
+  try {
+    const first = await request({
+      model: 'deepseek-v4-pro', session_id: 'immediate-cancel-key',
+      messages: [{ role: 'user', content: 'cancel immediately' }], stream: true,
+    });
+    const cancellation = first.body!.cancel('cancel before read');
+    await cancellationStarted;
+    const secondRequest = request({
+      model: 'deepseek-v4-pro', session_id: 'immediate-cancel-key',
+      messages: [{ role: 'user', content: 'second request' }], stream: false,
+    });
+    const reachedUpstreamEarly = await Promise.race([
+      secondFetchStarted.then(() => true),
+      new Promise<false>(resolve => setImmediate(() => resolve(false))),
+    ]);
+    assert.strictEqual(reachedUpstreamEarly, false);
+    releaseCancellation();
+    await cancellation;
+    const second = await secondRequest;
+    assert.strictEqual(firstSourceCancelled, true);
+    assert.strictEqual(cancellationFinished, true);
+    assert.strictEqual(second.status, 200);
+    assert.strictEqual(fetches, 2);
+  } finally {
+    releaseCancellation();
+    delete process.env.DEEPSPROXY_SESSION_LEASE_TIMEOUT_MS;
+    restore();
+  }
+});
+
+test('invalid successful upstream status is normalized to 502', async () => {
+  const restore = setupFetchMock(() => new Response(null, { status: 200 }));
+  try {
+    const response = await request({
+      model: 'deepseek-v4-pro',
+      messages: [{ role: 'user', content: 'missing upstream body' }], stream: false,
+    });
+    assert.strictEqual(response.status, 502);
+  } finally {
+    restore();
+  }
+});
+
+test('session lease wait is bounded and returns 429 with Retry-After', async () => {
+  const key = 'lease-timeout-key';
+  const release = await acquireSessionLease(`explicit:${key}`);
+  if (!release) throw new Error('Failed to acquire setup lease');
+  process.env.DEEPSPROXY_SESSION_LEASE_TIMEOUT_MS = '20';
+  try {
+    const result = await Promise.race([
+      request({
+        model: 'deepseek-v4-pro', session_id: key,
+        messages: [{ role: 'user', content: 'must not wait forever' }], stream: false,
+      }),
+      new Promise<'timed-out'>(resolve => setTimeout(() => resolve('timed-out'), 250)),
+    ]);
+    assert.notStrictEqual(result, 'timed-out');
+    const response = result as Response;
+    assert.strictEqual(response.status, 429);
+    assert.strictEqual(response.headers.get('Retry-After'), '1');
+  } finally {
+    delete process.env.DEEPSPROXY_SESSION_LEASE_TIMEOUT_MS;
+    release();
   }
 });
 

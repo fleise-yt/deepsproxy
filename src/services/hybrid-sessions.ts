@@ -2,7 +2,7 @@ import crypto from 'node:crypto';
 
 interface HybridSession {
   chatSessionId: string;
-  parentMessageId: number;
+  parentMessageId: number | null;
   updatedAt: number;
   matchedLength?: number;
 }
@@ -13,6 +13,11 @@ const MAX_LINEAGE_ENTRIES = 2_000;
 const MAX_EXPLICIT_ENTRIES = 2_000;
 const MAX_SESSION_KEY_LENGTH = 256;
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000;
+
+function sessionLeaseTimeoutMs(): number {
+  const configured = Number(process.env.DEEPSPROXY_SESSION_LEASE_TIMEOUT_MS || '30000');
+  return Number.isFinite(configured) && configured > 0 ? configured : 30000;
+}
 
 /**
  * Per-key mutex: only one in-flight continuation per explicit session key.
@@ -26,14 +31,28 @@ const sessionLocks = new Map<string, Promise<unknown>>();
  * release callback. Unlike acquireSessionLock, callers can transfer ownership
  * to a response stream and release only after the stream is fully consumed.
  */
-export async function acquireSessionLease(key: string): Promise<() => void> {
+export async function acquireSessionLease(key: string): Promise<(() => void) | undefined> {
   const previous = sessionLocks.get(key) || Promise.resolve();
   let resolveCurrent!: () => void;
   const current = new Promise<void>(resolve => { resolveCurrent = resolve; });
   const queued = previous.catch(() => {}).then(() => current);
   sessionLocks.set(key, queued);
 
-  await previous.catch(() => {});
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  const acquired = await Promise.race([
+    previous.catch(() => {}).then(() => true),
+    new Promise<false>(resolve => {
+      timeout = setTimeout(() => resolve(false), sessionLeaseTimeoutMs());
+    }),
+  ]);
+  if (timeout) clearTimeout(timeout);
+  if (!acquired) {
+    resolveCurrent();
+    void queued.finally(() => {
+      if (sessionLocks.get(key) === queued) sessionLocks.delete(key);
+    });
+    return undefined;
+  }
   let released = false;
   return () => {
     if (released) return;
@@ -48,6 +67,7 @@ export async function acquireSessionLease(key: string): Promise<() => void> {
 export function acquireSessionLock<T>(key: string, task: () => Promise<T>): Promise<T> {
   return (async () => {
     const release = await acquireSessionLease(key);
+    if (!release) throw new Error(`Timed out waiting for session lease: ${key}`);
     try {
       return await task();
     } finally {
@@ -68,8 +88,23 @@ function canonicalMessage(message: any): Record<string, unknown> {
 }
 
 export function fingerprintMessages(messages: any[]): string {
-  const canonical = messages.map(canonicalMessage);
-  return crypto.createHash('sha256').update(JSON.stringify(canonical)).digest('hex');
+  const hasher = crypto.createHash('sha256');
+  for (const message of messages) {
+    const encoded = JSON.stringify(canonicalMessage(message));
+    hasher.update(String(Buffer.byteLength(encoded))).update(':').update(encoded);
+  }
+  return hasher.digest('hex');
+}
+
+function prefixFingerprints(messages: any[]): string[] {
+  const hasher = crypto.createHash('sha256');
+  const fingerprints: string[] = [];
+  for (const message of messages) {
+    const encoded = JSON.stringify(canonicalMessage(message));
+    hasher.update(String(Buffer.byteLength(encoded))).update(':').update(encoded);
+    fingerprints.push(hasher.copy().digest('hex'));
+  }
+  return fingerprints;
 }
 
 function pruneLineages(): void {
@@ -101,8 +136,9 @@ export function findLineageSession(messages: any[]): HybridSession | undefined {
     return undefined;
   }
 
+  const fingerprints = prefixFingerprints(messages);
   for (let end = messages.length - 1; end > 0; end--) {
-    const session = lineageSessions.get(fingerprintMessages(messages.slice(0, end)));
+    const session = lineageSessions.get(fingerprints[end - 1]);
     if (session) {
       if (Date.now() - session.updatedAt > SESSION_TTL_MS) {
         continue;
@@ -136,10 +172,22 @@ export function registerLineageSession(messages: any[], chatSessionId: string, p
   pruneLineages();
 }
 
-export function registerExplicitSession(sessionKey: string | undefined, chatSessionId: string, parentMessageId: number): void {
+export function registerExplicitSession(sessionKey: string | undefined, chatSessionId: string, parentMessageId: number | null): void {
   if (!validSessionKey(sessionKey) || !chatSessionId) return;
   pruneExplicitSessions();
   explicitSessions.set(sessionKey, { chatSessionId, parentMessageId, updatedAt: Date.now() });
+}
+
+export function unregisterExplicitSession(
+  sessionKey: string | undefined,
+  chatSessionId: string,
+  onlyIfParentIsNull = false
+): void {
+  if (!validSessionKey(sessionKey)) return;
+  const session = explicitSessions.get(sessionKey);
+  if (!session || session.chatSessionId !== chatSessionId) return;
+  if (onlyIfParentIsNull && session.parentMessageId !== null) return;
+  explicitSessions.delete(sessionKey);
 }
 
 export function incrementalMessages(messages: any[]): any[] {

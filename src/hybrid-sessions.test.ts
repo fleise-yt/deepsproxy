@@ -77,7 +77,11 @@ test('concurrent bootstrap requests with the same explicit key are serialized', 
   let calls = 0;
   let releaseFirst!: () => void;
   let signalFirst!: () => void;
+  let signalSecond!: () => void;
+  let firstReleased = false;
+  let secondArrivedBeforeRelease = false;
   const firstEntered = new Promise<void>(resolve => { signalFirst = resolve; });
+  const secondEntered = new Promise<void>(resolve => { signalSecond = resolve; });
   const firstGate = new Promise<void>(resolve => { releaseFirst = resolve; });
   const restore = setupFetchMock(async () => {
     calls++;
@@ -87,6 +91,9 @@ test('concurrent bootstrap requests with the same explicit key are serialized', 
     if (call === 1) {
       signalFirst();
       await firstGate;
+    } else if (call === 2) {
+      secondArrivedBeforeRelease = !firstReleased;
+      signalSecond();
     }
     active--;
     return upstream(6000 + call);
@@ -103,12 +110,15 @@ test('concurrent bootstrap requests with the same explicit key are serialized', 
       model: 'deepseek-v4-pro', session_id: 'concurrent-bootstrap-key',
       messages: [{ role: 'user', content: 'second' }], stream: false,
     });
-    await new Promise(resolve => setTimeout(resolve, 25));
-    assert.strictEqual(maxActive, 1);
+    firstReleased = true;
     releaseFirst();
+    await secondEntered;
+    assert.strictEqual(secondArrivedBeforeRelease, false);
+    assert.strictEqual(maxActive, 1);
     assert.strictEqual((await first).status, 200);
     assert.strictEqual((await second).status, 200);
   } finally {
+    firstReleased = true;
     releaseFirst();
     delete process.env.TEST_SESSION_ID;
     restore();
@@ -118,10 +128,18 @@ test('concurrent bootstrap requests with the same explicit key are serialized', 
 test('explicit session lock remains held until a streaming response is consumed', async () => {
   let calls = 0;
   let releaseStream!: () => void;
+  let signalThird!: () => void;
+  let streamClosed = false;
+  let thirdArrivedBeforeStreamClosed = false;
   const streamGate = new Promise<void>(resolve => { releaseStream = resolve; });
+  const thirdEntered = new Promise<void>(resolve => { signalThird = resolve; });
   const restore = setupFetchMock(() => {
     calls++;
     const call = calls;
+    if (call === 3) {
+      thirdArrivedBeforeStreamClosed = !streamClosed;
+      signalThird();
+    }
     if (call !== 2) return upstream(7000 + call);
     return new Response(new ReadableStream({
       async start(controller) {
@@ -129,6 +147,7 @@ test('explicit session lock remains held until a streaming response is consumed'
         controller.enqueue(new TextEncoder().encode('data: {"p":"response/content","v":"ok"}\n\n'));
         await streamGate;
         controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+        streamClosed = true;
         controller.close();
       }
     }), { status: 200 });
@@ -151,14 +170,73 @@ test('explicit session lock remains held until a streaming response is consumed'
       model: 'deepseek-v4-pro', session_id: 'stream-lock-key',
       messages: [{ role: 'user', content: 'must wait' }], stream: false,
     });
-    await new Promise(resolve => setTimeout(resolve, 25));
-    assert.strictEqual(calls, 2, 'Queued request reached DeepSeek before the stream finished');
     releaseStream();
     await consume;
+    await thirdEntered;
+    assert.strictEqual(thirdArrivedBeforeStreamClosed, false, 'Queued request reached DeepSeek before the stream finished');
     assert.strictEqual((await queued).status, 200);
     assert.strictEqual(calls, 3);
   } finally {
     releaseStream();
+    delete process.env.TEST_SESSION_ID;
+    restore();
+  }
+});
+
+test('initial stream publishes a locked session before exposing its session header', async () => {
+  let calls = 0;
+  let firstClosed = false;
+  let secondArrivedBeforeFirstClosed = false;
+  let signalSecond!: () => void;
+  let releaseFirst!: () => void;
+  const secondEntered = new Promise<void>(resolve => { signalSecond = resolve; });
+  const firstGate = new Promise<void>(resolve => { releaseFirst = resolve; });
+  const restore = setupFetchMock(() => {
+    calls++;
+    const call = calls;
+    if (call > 1) {
+      secondArrivedBeforeFirstClosed = !firstClosed;
+      signalSecond();
+      return upstream(7500 + call, 'second');
+    }
+    return new Response(new ReadableStream({
+      async start(controller) {
+        controller.enqueue(new TextEncoder().encode('event: ready\ndata: {"response_message_id":7501}\n\n'));
+        controller.enqueue(new TextEncoder().encode('data: {"p":"response/content","v":"first"}\n\n'));
+        await firstGate;
+        firstClosed = true;
+        controller.enqueue(new TextEncoder().encode('data: [DONE]\n\n'));
+        controller.close();
+      }
+    }), { status: 200 });
+  });
+
+  try {
+    process.env.TEST_SESSION_ID = 'initial-stream-session';
+    const firstResponse = await request({
+      model: 'deepseek-v4-pro',
+      messages: [{ role: 'user', content: 'initial stream' }], stream: true,
+    });
+    const exposedSessionId = firstResponse.headers.get('x-deeps-session');
+    assert.strictEqual(exposedSessionId, 'initial-stream-session');
+    const firstConsume = firstResponse.text();
+    const secondRequest = request({
+      model: 'deepseek-v4-pro', session_id: exposedSessionId,
+      messages: [{ role: 'user', content: 'follow immediately' }], stream: false,
+    });
+    const reachedEarly = await Promise.race([
+      secondEntered.then(() => true),
+      new Promise<false>(resolve => setImmediate(() => resolve(false))),
+    ]);
+    assert.strictEqual(reachedEarly, false);
+    releaseFirst();
+    await firstConsume;
+    await secondEntered;
+    assert.strictEqual((await secondRequest).status, 200);
+    assert.strictEqual(secondArrivedBeforeFirstClosed, false);
+    assert.strictEqual(calls, 2);
+  } finally {
+    releaseFirst();
     delete process.env.TEST_SESSION_ID;
     restore();
   }

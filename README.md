@@ -93,15 +93,23 @@ PORT=3000
 # Interface HTTP (default seguro: apenas loopback)
 HOST=127.0.0.1
 
-# Chave de API para proteger endpoints (opcional)
+# Chave de API para proteger endpoints (obrigatória se HOST não for loopback)
 API_KEY=sua-chave-secreta-aqui
 
 # Configurações Playwright
 PLAYWRIGHT_HEADLESS=true
 PLAYWRIGHT_TIMEOUT=30000
 
+# Fila/tempo máximo total para capturar PoW (inclui espera na fila)
+DEEPSPROXY_POW_QUEUE_MAX=32
+DEEPSPROXY_POW_TIMEOUT_MS=30000
+DEEPSPROXY_POW_CLEANUP_GRACE_MS=1000
+
 # Deadline total de cada stream upstream (ms)
 DEEPSPROXY_UPSTREAM_TIMEOUT_MS=300000
+
+# Tempo máximo aguardando outra chamada da mesma conversa (ms)
+DEEPSPROXY_SESSION_LEASE_TIMEOUT_MS=30000
 
 # Logging
 LOG_LEVEL=info
@@ -113,10 +121,14 @@ LOG_LEVEL=info
 |----------|-----------|---------|------------|
 | `PORT` | Porta HTTP do servidor | `3000` | Não |
 | `HOST` | Interface HTTP; use `0.0.0.0` somente quando necessário | `127.0.0.1` | Não |
-| `API_KEY` | Chave para autenticação de requests | - | Não |
+| `API_KEY` | Chave para autenticação de requests | - | Somente se `HOST` não for loopback |
 | `PLAYWRIGHT_HEADLESS` | Executar browser em modo headless | `true` | Não |
 | `PLAYWRIGHT_TIMEOUT` | Timeout para operações do Playwright (ms) | `30000` | Não |
+| `DEEPSPROXY_POW_QUEUE_MAX` | Máximo de capturas PoW ativas/enfileiradas | `32` | Não |
+| `DEEPSPROXY_POW_TIMEOUT_MS` | Deadline total da captura PoW, incluindo fila | `30000` | Não |
+| `DEEPSPROXY_POW_CLEANUP_GRACE_MS` | Limite adicional para limpeza após timeout PoW | `1000` | Não |
 | `DEEPSPROXY_UPSTREAM_TIMEOUT_MS` | Deadline do stream DeepSeek; libera locks ao expirar | `300000` | Não |
+| `DEEPSPROXY_SESSION_LEASE_TIMEOUT_MS` | Limite de espera por uma conversa ocupada | `30000` | Não |
 
 \* Necessária para funcionalidades que requerem acesso à API DeepSeek
 
